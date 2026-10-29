@@ -7,7 +7,7 @@ use luminal::prelude::petgraph::visit::EdgeRef;
 use luminal::prelude::*;
 
 use super::test_support::*;
-use super::{Translation, opmath_target};
+use super::{Translation, exact_arithmetic_target, opmath_target};
 
 // ---------------------------------------------------------------------
 // Graph facts
@@ -381,25 +381,49 @@ fn integer_tensor_against_a_float_literal_compares_at_f32() {
     assert!(input_is_cast_to(&t, "i", DType::F32));
 }
 
+/// An exact op whose lowering computes (`neg` is a multiply by -1, `abs`
+/// a multiply by the sign, a rounding is a math function) reads narrow
+/// storage through an explicit widening cast and rounds back to the
+/// declared dtype: the graph computes nothing in F16 or BF16.
+#[test]
+fn exact_arithmetic_widens_narrow_storage() {
+    for target in [
+        "abs.default",
+        "neg.default",
+        "floor.default",
+        "ceil.default",
+        "trunc.default",
+        "round.default",
+    ] {
+        for (code, dtype) in [(HALF, DType::F16), (BFLOAT16, DType::Bf16)] {
+            let t = translate_one(
+                node(
+                    &format!("torch.ops.aten.{target}"),
+                    vec![tensor_input("self", "a")],
+                    &["y"],
+                ),
+                &[("a", code, &[4]), ("y", code, &[4])],
+                &["a"],
+                &["y"],
+            );
+            assert!(
+                input_is_cast_to(&t, "a", DType::F32),
+                "{target} {dtype:?} widens its operand"
+            );
+            assert_eq!(t.outputs[0].dtype, dtype, "{target} rounds back");
+            let logical = &t.graph.logical;
+            assert!(
+                logical
+                    .narrow_float_arithmetic(logical.petgraph().node_indices())
+                    .is_empty(),
+                "{target} {dtype:?} computes in its storage dtype"
+            );
+        }
+    }
+}
+
 #[test]
 fn exact_ops_never_cast_their_operand() {
-    let neg = translate_one(
-        node(
-            "torch.ops.aten.neg.default",
-            vec![tensor_input("self", "a")],
-            &["y"],
-        ),
-        &[("a", HALF, &[4]), ("y", HALF, &[4])],
-        &["a"],
-        &["y"],
-    );
-    assert!(
-        consumers_of_input(&neg, "a")
-            .into_iter()
-            .all(|id| !is_op(op_of(&neg, id), &LogicalOp::Cast(DType::F32)))
-    );
-    assert_eq!(neg.outputs[0].dtype, DType::F16);
-
     let clamp = translate_one(
         node(
             "torch.ops.aten.clamp.default",
@@ -482,10 +506,18 @@ fn attention_reads_a_bool_mask_as_a_predicate() {
     );
     assert_eq!(t.outputs[0].dtype, DType::F16);
     assert!(
-        input_is_cast_to(&t, "m", DType::F32),
-        "the keep-mask is read"
+        consumers_of_input(&t, "m").into_iter().any(|id| {
+            is_op(op_of(&t, id), &LogicalOp::Select)
+                && is_input_named(op_of(&t, through_views(&t, operands(&t, id)[0])), "m")
+        }),
+        "the keep-mask is read as a select condition"
     );
-    assert!(!input_is_cast_to(&t, "m", DType::F16));
+    for dtype in [DType::F16, DType::F32] {
+        assert!(
+            !input_is_cast_to(&t, "m", dtype),
+            "the keep-mask is never an operand of the score arithmetic ({dtype:?})"
+        );
+    }
 }
 
 #[test]
@@ -513,6 +545,8 @@ fn opmath_class_membership() {
     ] {
         assert!(!opmath_target(target), "{target} is exact");
     }
+    assert!(exact_arithmetic_target("neg.default"));
+    assert!(!exact_arithmetic_target("clamp.default"));
 }
 
 #[test]
@@ -569,7 +603,11 @@ fn attention_keeps_compute_precision_until_the_operator_output() {
                 .map(|id| through_views(&t, id))
                 .find(|&id| is_op(op_of(&t, id), &LogicalOp::Recip))
                 .expect("normalization follows the value contraction");
-            let denominator = through_views(&t, operands(&t, divisor)[0]);
+            // A row with no admissible key divides by 1 (RowStats); every
+            // other row selects the reduced sum, the false branch.
+            let guarded = through_views(&t, operands(&t, divisor)[0]);
+            assert!(is_op(op_of(&t, guarded), &LogicalOp::Select));
+            let denominator = through_views(&t, operands(&t, guarded)[2]);
             assert!(is_op(
                 op_of(&t, denominator),
                 &LogicalOp::ReduceSum { axis_from_end: 0 }
@@ -579,6 +617,19 @@ fn attention_keeps_compute_precision_until_the_operator_output() {
             assert_eq!(dtype_of(&t, weights), DType::F32);
             for id in nodes(&t) {
                 if id == output || matches!(op_of(&t, id), LogicalOp::Input { .. }) {
+                    continue;
+                }
+                // The empty-row predicate (a comparison of the row max) is
+                // Bool by type; it selects values but is not one of them.
+                if dtype_of(&t, id) == DType::Bool {
+                    assert!(
+                        matches!(
+                            op_of(&t, id),
+                            LogicalOp::LessThan | LogicalOp::IndexMapApply { .. }
+                        ),
+                        "{variant}: a Bool SDPA node is not a predicate: {:?}",
+                        op_of(&t, id)
+                    );
                     continue;
                 }
                 assert_eq!(

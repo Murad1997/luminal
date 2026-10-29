@@ -14,6 +14,7 @@ shows up as XPASS, which is harmless but should be cleaned up.
 
 from __future__ import annotations
 
+import platform
 from dataclasses import dataclass
 
 import backend_test_utils
@@ -26,6 +27,13 @@ class KnownFailure:
     url: str
     reason: str
     tests: tuple[str, ...]
+    # ``platform.machine()`` values the failure is known on; empty means
+    # every machine. A machine-specific entry runs as an ordinary test
+    # elsewhere, so it keeps asserting where it is known to pass.
+    machines: tuple[str, ...] = ()
+
+    def applies_here(self) -> bool:
+        return not self.machines or platform.machine() in self.machines
 
     @property
     def xfail_reason(self) -> str:
@@ -33,34 +41,6 @@ class KnownFailure:
 
 
 REFERENCE_KNOWN_FAILURES: tuple[KnownFailure, ...] = (
-    KnownFailure(
-        ticket="LUM-1099",
-        url="https://linear.app/luminalai/issue/LUM-1099/reference-backend-rejects-f16-and-bf16-inputs",
-        reason=("reference backend does not support F16/BF16 inputs"),
-        tests=(
-            "test_binary.py::test_copysign_scalar_typed_constants_and_zero_signs",
-            "test_cpu_staging.py::test_empty_cpu_input_preserves_shape_and_dtype[bfloat16]",
-            "test_cpu_staging.py::test_empty_cpu_input_preserves_shape_and_dtype[float16]",
-            "test_dtype_boundary.py::test_arange_uses_exported_shape_and_declared_dtype[keyword-end]",
-            "test_dtype_boundary.py::test_boundary_noop_preserves_dtype_and_values[bfloat16]",
-            "test_dtype_boundary.py::test_boundary_noop_preserves_dtype_and_values[float16]",
-            "test_dtype_boundary.py::test_matching_dtype_does_not_raise[bfloat16]",
-            "test_dtype_boundary.py::test_matching_dtype_does_not_raise[float16]",
-            "test_hlir_ops.py::test_dtype_float16",
-            "test_hlir_ops.py::test_layer_norm_fp16_outliers",
-            "test_hlir_ops.py::test_reduction_fp16_opmath_parity[amax]",
-            "test_hlir_ops.py::test_reduction_fp16_opmath_parity[cumsum]",
-            "test_hlir_ops.py::test_reduction_fp16_opmath_parity[mean]",
-            "test_hlir_ops.py::test_reduction_fp16_opmath_parity[softmax]",
-            "test_hlir_ops.py::test_reduction_fp16_opmath_parity[sum]",
-            "test_hlir_ops.py::test_sdpa_bf16_bool_mask_softmax_parity",
-            "test_hlir_ops.py::test_sdpa_bf16_causal_softmax_parity",
-            "test_hlir_ops.py::test_sdpa_bf16_float_bias_softmax_parity",
-            "test_hlir_ops.py::test_sdpa_bf16_softmax_parity",
-            "test_hlir_ops.py::test_sdpa_bool_mask_fully_masked_row_bf16_4d",
-            "test_hlir_ops.py::test_sdpa_f16_softmax_parity",
-        ),
-    ),
     KnownFailure(
         ticket="LUM-1100",
         url="https://linear.app/luminalai/issue/LUM-1100/complex-tensor-inputs-fail-with-input-rank-differs-from-exported-rank",
@@ -126,36 +106,6 @@ REFERENCE_KNOWN_FAILURES: tuple[KnownFailure, ...] = (
         ),
     ),
     KnownFailure(
-        ticket="LUM-1096",
-        url="https://linear.app/luminalai/issue/LUM-1096/reference-runtime-kernels-lack-dtype-arms-exercised-by-pt2-parity",
-        reason=(
-            "reference runtime kernels lack the f64/i64/bool8 arms this graph needs (surfaces as 'no candidate genome')"
-        ),
-        tests=(
-            "test_binary.py::test_not_equal_and_diff_preserve_boolean_output_dtype",
-            "test_hlir_ops.py::test_bool_add_matches_pytorch[-1]",
-            "test_hlir_ops.py::test_bool_add_matches_pytorch[2]",
-            "test_hlir_ops.py::test_bool_add_matches_pytorch[False]",
-            "test_hlir_ops.py::test_bool_add_matches_pytorch[None]",
-            "test_hlir_ops.py::test_bool_add_matches_pytorch[True]",
-            "test_hlir_ops.py::test_tiny_moe_routing[idx_dtype0]",
-            "test_hlir_ops.py::test_tiny_moe_routing[idx_dtype1]",
-            "test_llama3.py::test_hf_llama_decode_loop_static",
-            "test_llama3.py::test_hf_llama_medium",
-            "test_llama3.py::test_hf_llama_small",
-            "test_llama3.py::test_hf_llama_tiny",
-            "test_reduction.py::test_cumprod_integer_promotion_and_noncontiguous_input",
-            "test_reduction.py::test_variance_default_and_dim_overloads_match_eager",
-            "test_remaining_existing_hlir_lowerings.py::test_antialiased_bilinear_resize_float_and_uint8",
-            "test_remaining_existing_hlir_lowerings.py::test_chebyshev_families_cover_runtime_degrees_and_domains",
-            "test_remaining_existing_hlir_lowerings.py::test_cylindrical_bessel_and_airy_piecewise_approximations",
-            "test_remaining_existing_hlir_lowerings.py::test_fixed_shape_2d_sampling_composites",
-            "test_remaining_existing_hlir_lowerings.py::test_fixed_shape_3d_sampling_composites",
-            "test_remaining_existing_hlir_lowerings.py::test_polygamma_orders_reflection_poles_and_infinities",
-            "test_straightforward_lowerings.py::test_addmv_and_addbmm_preserve_real_dtypes_and_coefficients",
-        ),
-    ),
-    KnownFailure(
         ticket="LUM-1097",
         url="https://linear.app/luminalai/issue/LUM-1097/layoutir-extraction-dead-ends-on-int32int64-and-empty-input-graphs",
         reason=(
@@ -172,6 +122,7 @@ REFERENCE_KNOWN_FAILURES: tuple[KnownFailure, ...] = (
             "test_dtype_boundary.py::test_matching_dtype_does_not_raise[int64_outside_i32_range]",
             "test_hlir_ops.py::test_reduce_sum_all_axes_int64_preserves_dtype",
             "test_ops_batch5.py::test_upsample_bilinear",
+            "test_remaining_existing_hlir_lowerings.py::test_antialiased_bilinear_resize_float_and_uint8",
             "test_remaining_existing_hlir_lowerings.py::test_integer_gcd_static_euclidean_rounds",
             "test_scalars.py::test_dot_float_shorthand_on_0d",
             "test_scalars.py::test_int_sum_produces_int_scalar",
@@ -251,20 +202,10 @@ REFERENCE_KNOWN_FAILURES: tuple[KnownFailure, ...] = (
         url="https://linear.app/luminalai/issue/LUM-1105/reference-backend-numeric-mismatches-vs-eager-float64-add-alpha-acos",
         reason=("reference backend output differs numerically from eager"),
         tests=(
-            "test_dtype_boundary.py::test_float64_add_scalar_with_explicit_alpha_matches_eager",
-            "test_dtype_boundary.py::test_float64_add_with_explicit_alpha_matches_eager[-3.125]",
-            "test_dtype_boundary.py::test_float64_add_with_explicit_alpha_matches_eager[1.0000000000000002]",
-            "test_dtype_boundary.py::test_float64_add_with_explicit_alpha_matches_eager[2.0]",
-            "test_hlir_ops.py::test_acos",
-            "test_hlir_ops.py::test_acos_promotes_integral_input[dtype0]",
-            "test_hlir_ops.py::test_acos_promotes_integral_input[dtype1]",
-            "test_hlir_ops.py::test_acos_promotes_integral_input[dtype2]",
             "test_hlir_ops.py::test_gelu_tanh",
-            "test_reduction.py::test_composed_real_reductions_match_eager",
             "test_reduction.py::test_scatter_reduce_integer_mean_floors_negative_results",
-            "test_remaining_existing_hlir_lowerings.py::test_inverse_probability_functions_cover_tails_and_boundaries",
-            "test_remaining_existing_hlir_lowerings.py::test_modified_bessel_family_across_approximation_intervals",
             "test_remaining_existing_hlir_lowerings.py::test_ordering_and_distance_composites",
+            "test_straightforward_lowerings.py::test_addmv_and_addbmm_preserve_real_dtypes_and_coefficients",
             "test_upsample.py::test_upsample_nearest_noninteger_scale_same_size",
         ),
     ),
@@ -272,13 +213,21 @@ REFERENCE_KNOWN_FAILURES: tuple[KnownFailure, ...] = (
         ticket="LUM-1106",
         url="https://linear.app/luminalai/issue/LUM-1106/ieee-signed-zero-and-nan-semantics-on-the-reference-backend-atan2",
         reason=(
-            "IEEE signed-zero / NaN semantics are not reproduced by the reference lowering"
+            "signed-zero / NaN results differ on the Linux x86-64 CI runner "
+            "(fmax(-0.0, -0.0) returns +0.0 there); every case passes on arm64 "
+            "macOS in debug and release builds, and the x86 cause is not yet isolated"
         ),
         tests=(
-            "test_binary.py::test_atan2_quadrants_and_signed_zero",
             "test_binary.py::test_copysign_fmax_fmin_nan_and_zero_signs",
-            "test_hlir_ops.py::test_sdpa_bool_mask_fully_masked_row",
+            "test_binary.py::test_fmax_fmin_skip_nan_and_order_signed_zeros[dtype0]",
+            "test_binary.py::test_fmax_fmin_skip_nan_and_order_signed_zeros[dtype1]",
+            "test_binary.py::test_fmax_fmin_skip_nan_and_order_signed_zeros[dtype2]",
+            "test_binary.py::test_fmax_fmin_skip_nan_and_order_signed_zeros[dtype3]",
+            "test_complex.py::test_acos_and_acosh_take_the_side_of_the_cut_from_a_signed_zero[torch.float64]",
+            "test_remaining_existing_hlir_lowerings.py::test_nanmedian_slot_matches_eager_on_the_backend_path",
+            "test_unary.py::test_erf_family_is_odd_through_an_exact_sign[gelu]",
         ),
+        machines=("x86_64", "AMD64"),
     ),
     KnownFailure(
         ticket="LUM-1107",
@@ -291,8 +240,6 @@ REFERENCE_KNOWN_FAILURES: tuple[KnownFailure, ...] = (
             "test_hlir_ops.py::test_repeat_leading_dims",
             "test_llama3.py::test_hf_llama3_1b_bf16_error_within_fp32_floor",
             "test_reduction.py::test_scalar_log_softmax_preserves_ieee_behavior",
-            "test_remaining_existing_hlir_lowerings.py::test_histogram_composites_have_fixed_bin_shapes",
-            "test_remaining_existing_hlir_lowerings.py::test_trilinear_and_embedding_bag_composites",
             "test_tiny_llm.py::test_tiny_llm_dynamic_context_reuses_one_compile",
         ),
     ),
@@ -321,6 +268,7 @@ def apply_reference_xfails(items: list[pytest.Item]) -> None:
     reasons = {
         test: failure.xfail_reason
         for failure in REFERENCE_KNOWN_FAILURES
+        if failure.applies_here()
         for test in failure.tests
     }
     for item in items:

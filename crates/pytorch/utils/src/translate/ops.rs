@@ -395,12 +395,10 @@ impl Translator<'_> {
         } else if dim.is_none() {
             let flat = util::reshape_tensor(x, &[x.dims().into_iter().product()]);
             if max { flat.argmax(0) } else { flat.argmin(0) }
+        } else if max {
+            x.argmax(axes[0])
         } else {
-            if max {
-                x.argmax(axes[0])
-            } else {
-                x.argmin(axes[0])
-            }
+            x.argmin(axes[0])
         };
         let dtype = self.output_meta_dtype(node).unwrap_or(DType::I64);
         let result = if result.dtype != dtype {
@@ -415,32 +413,6 @@ impl Translator<'_> {
         })
     }
 
-    pub(super) fn translate_var(&mut self, node: &Node, std: bool) -> Result<GraphTensor> {
-        let x = self.operand(&node.inputs[0])?;
-        let dims = self.optional_int_list(node, 1)?;
-        let rank = x.rank();
-        let axes: Vec<usize> = if dims.is_empty() {
-            (0..rank).collect()
-        } else {
-            dims.iter().map(|&d| normalize_dim(d, rank)).collect()
-        };
-        let correction = self.named_int_arg(node, "correction").unwrap_or(1) as usize;
-        let result = if std {
-            x.std_options(axes.clone(), correction)
-        } else {
-            x.var_options(axes.clone(), correction)
-        };
-        let keepdim = self
-            .inputs_bool(node, "keepdim")
-            .or_else(|| node.inputs.get(3).and_then(|i| i.arg.as_bool()))
-            .unwrap_or(false);
-        Ok(if keepdim {
-            keep_axes(result, &axes)
-        } else {
-            result
-        })
-    }
-
     pub(super) fn translate_cumulative(&mut self, node: &Node, prod: bool) -> Result<GraphTensor> {
         let x = self.operand(&node.inputs[0])?;
         // ATen casts BEFORE scanning: absent dtype promotes bool/integer
@@ -448,7 +420,8 @@ impl Translator<'_> {
         // output metadata has already resolved both cases, even when the
         // exported node has no dtype argument or explicit cast. Luminal's
         // scans themselves preserve their operand dtype.
-        let x = super::convert(x, self.output_meta_dtype(node)?);
+        let result = self.output_meta_dtype(node)?;
+        let x = super::convert(x, result);
         let dim = self.get_int_arg(node, 1)?;
         // A rank-0 scan is the identity AFTER the dtype conversion.
         if x.rank() == 0 {
@@ -458,11 +431,18 @@ impl Translator<'_> {
             return Ok(x);
         }
         let dim = normalize_dim(dim, x.rank());
-        Ok(if prod {
+        // The running total accumulates in the result dtype's opmath
+        // (ATen's `acc_type`: F32 for F16/BF16) and each partial sum is
+        // rounded to the result dtype once. A half-precision scan that
+        // rounded every step would drift by whole ulps of the total.
+        let compute = super::opmath_compute(result);
+        let x = super::convert(x, compute);
+        let scanned = if prod {
             x.cumprod(vec![dim])
         } else {
             x.cumsum(vec![dim])
-        })
+        };
+        Ok(super::convert(scanned, result))
     }
 
     /// `max.dim` / `min.dim`: values and indices into one graph.
