@@ -1,0 +1,103 @@
+; Complete production vocabulary. Both executable forms require complete approval.
+; ElementStride describes what the layout fixes. Any is local freedom, not IntExpr equality.
+; API names: D = alpha * op(A) * op(B) + beta * C, followed by the epilogue.
+; C is a full matrix. The optional epilogue bias is a separate vector.
+(datatype CublasLtMatrixOrder (CublasLtRowMajor) (CublasLtColumnMajor))
+(datatype CublasLtMatrixOperation (CublasLtNoTranspose) (CublasLtTranspose))
+(datatype CublasLtComputationType
+  (CublasLtFloat32Computation)
+  (CublasLtTensorFloat32Computation))
+; Pointer location is an approved API capability; values belong to the call.
+(datatype CublasLtScalarPointerMode
+  (CublasLtHostScalarPointerMode) (CublasLtDeviceScalarPointerMode))
+(datatype CublasLtScalarArguments
+  (CublasLtHostScalarArguments f64 f64)
+  (CublasLtDeviceScalarArguments LayoutTensor LayoutTensor))
+(datatype CublasLtEpilogue
+  (CublasLtDefaultEpilogue)
+  (CublasLtRectifiedLinearEpilogue)
+  (CublasLtBiasEpilogue)
+  (CublasLtRectifiedLinearBiasEpilogue)
+  (CublasLtGaussianErrorLinearEpilogue)
+  (CublasLtGaussianErrorLinearBiasEpilogue))
+(datatype CublasLtBiasDataType (CublasLtNoBiasDataType) (CublasLtBiasDataTypeOf Dtype))
+(datatype CublasLtCMatrixDataType (CublasLtNoCMatrixDataType) (CublasLtCMatrixDataTypeOf Dtype))
+(datatype CublasLtLogicalCMatrix (CublasLtNoCMatrix) (CublasLtCMatrixOf LogicalTensor))
+(datatype CublasLtLogicalBias (CublasLtNoBias) (CublasLtBiasOf LogicalTensor))
+(datatype CublasLtMatrixLayout
+  (CublasLtMatrixLayoutLit
+    Dtype                 ; StorageDataType
+    CublasLtMatrixOrder    ; MatrixOrder
+    IntExpr               ; Rows, before op(A) or op(B)
+    IntExpr               ; Columns, before op(A) or op(B)
+    IntExpr               ; LeadingDimension, in elements
+    IntExpr               ; BatchCount
+    IntExpr))             ; BatchStrideInElements
+(datatype CublasLtMatrixDescriptor
+  (CublasLtMatrixDescriptorOf
+    LayoutTensor          ; storage tensor
+    CublasLtMatrixLayout)) ; complete vendor layout description
+(datatype CublasLtCMatrixArgument
+  (CublasLtCMatrixAbsent)
+  (CublasLtCMatrixInput CublasLtMatrixDescriptor))
+(datatype CublasLtBiasArgument (CublasLtBiasAbsent) (CublasLtBiasInput LayoutTensor Dtype))
+; Full configuration: compute, scale, A/B/D storage, C/bias storage or absence,
+; scalar pointer mode, epilogue, A/B/D orders, A/B operations. Matrix and batch
+; geometry live in the descriptors and require the corresponding layout proofs.
+(datatype CublasLtConfiguration
+  (CublasLtConfigurationOf
+    CublasLtComputationType    ; computation precision
+    Dtype                     ; alpha/beta scalar data type
+    Dtype                     ; A storage data type
+    Dtype                     ; B storage data type
+    CublasLtCMatrixDataType    ; C storage data type, or explicit absence
+    Dtype                     ; D storage data type
+    CublasLtBiasDataType       ; bias storage data type, or explicit absence
+    CublasLtScalarPointerMode ; alpha and beta pointer location
+    CublasLtEpilogue           ; epilogue operation
+    CublasLtMatrixOrder        ; A order
+    CublasLtMatrixOrder        ; B order
+    CublasLtMatrixOrder        ; D order; C must have the same order
+    CublasLtMatrixOperation    ; op(A)
+    CublasLtMatrixOperation))  ; op(B)
+; A frame ties every component to one complete expression. The first tensor
+; is the original expression; the second is the output in the API call frame.
+(datatype CublasLtExpressionFrame
+  (CublasLtExpressionFrameOf
+    LogicalTensor           ; original expression
+    LogicalTensor           ; output in the API call frame
+    LogicalTensor           ; logical A operand
+    LogicalTensor           ; logical B operand
+    CublasLtLogicalCMatrix   ; logical C matrix, or explicit absence
+    CublasLtLogicalBias      ; logical bias vector, or explicit absence
+    CublasLtEpilogue
+    LogicalTensor           ; alpha, rank-zero F32
+    LogicalTensor))         ; beta, rank-zero F32
+(constructor LayoutTensorOpCublasLtCall
+  (CublasLtConfiguration       ; complete approved configuration
+    CublasLtMatrixDescriptor   ; A matrix descriptor
+    CublasLtMatrixDescriptor   ; B matrix descriptor
+    CublasLtCMatrixArgument    ; C matrix argument, including the beta-zero case
+    CublasLtBiasArgument       ; optional epilogue bias vector
+    CublasLtMatrixDescriptor   ; D matrix descriptor
+    LayoutTensorList          ; physical input tensors
+    CublasLtExpressionFrame    ; complete logical expression
+    CublasLtScalarArguments)   ; literal host values or device scalar storage
+  LayoutTensorOp)
+
+; Read-modify-write form. One descriptor serves both C and D; the result
+; must use operand C's storage, relocated by conflict repair when necessary.
+(constructor LayoutTensorOpCublasLtAccumulateInPlace
+  (CublasLtConfiguration       ; complete approved configuration
+    CublasLtMatrixDescriptor   ; A matrix descriptor
+    CublasLtMatrixDescriptor   ; B matrix descriptor
+    CublasLtMatrixDescriptor   ; shared C/D matrix descriptor, anchored on C
+    CublasLtBiasArgument       ; optional epilogue bias vector
+    LayoutTensorList          ; A, B, optional device scalars, optional bias, C
+    CublasLtExpressionFrame
+    CublasLtScalarArguments)
+  LayoutTensorOp)
+
+; Computation contract, semantic F32 operand, physical descriptor source.
+; Bypassing a rounding cast is valid only for the computation that performs it.
+(relation cublaslt-operand-storage-reading (CublasLtComputationType LogicalTensor LogicalTensor))

@@ -1,0 +1,14 @@
+; The shared input assembly already puts C last. Its read-modify-write tie
+; stays unconditional for host and device scalars, with or without bias.
+(rule
+  ((cublaslt-approved-inputs ?configuration ?A_descriptor ?B_descriptor
+     (CublasLtCMatrixInput ?C_descriptor) ?bias_argument ?D_descriptor ?frame ?scalars ?inputs)
+   (= ?C_descriptor (CublasLtMatrixDescriptorOf ?C_tensor ?matrix_layout))
+   (= ?D_descriptor (CublasLtMatrixDescriptorOf ?D_tensor ?matrix_layout))
+   (= ?C_tensor (LayoutTensorLit ?C ?layout))
+   (= ?D_tensor (LayoutTensorLit ?D ?layout)))
+  ((union (LayoutTensorOpLit ?inputs (LayoutTensorCons ?D_tensor (LayoutTensorNil)))
+     (LayoutTensorOpCublasLtAccumulateInPlace ?configuration ?A_descriptor ?B_descriptor
+       ?C_descriptor ?bias_argument ?inputs ?frame ?scalars)))
+  :ruleset backend
+  :name "cublaslt: emit approved in place accumulation with one shared C D descriptor")

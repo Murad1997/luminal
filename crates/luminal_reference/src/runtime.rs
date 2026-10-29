@@ -605,7 +605,7 @@ impl ReferenceRuntime {
                 .ok_or_else(|| anyhow!("buffer {} has no dtype", buffer.label))?;
             let empty = TypedBuffer::zeroed(dtype, 0)?;
             let bytes = numel
-                .checked_mul(usize::try_from(dtype.egglog_bits())?.div_ceil(8))
+                .checked_mul(empty.element_bytes())
                 .ok_or_else(|| anyhow!("buffer {} size overflow", buffer.label))?;
             geometry.insert(id.clone(), (numel, dtype, bytes, empty.type_name()));
         }
@@ -662,7 +662,8 @@ impl ReferenceRuntime {
                         last_use.insert(id.clone(), step);
                     }
                 }
-                BufferNode::BufferCopy { src, dst } => {
+                BufferNode::BufferCopy { src, dst, .. }
+                | BufferNode::BufferCopyValue { src, dst, .. } => {
                     last_use.insert(src.clone(), step);
                     last_use.insert(dst.clone(), step);
                 }
@@ -695,17 +696,29 @@ impl ReferenceRuntime {
             crate::search::check_interrupt()?;
             match &plan.dag[index] {
                 BufferNode::BufferInput { .. } | BufferNode::BufferOutput { .. } => {}
-                BufferNode::BufferCopy { src, dst } => {
+                BufferNode::BufferCopy { src, dst, .. }
+                | BufferNode::BufferCopyValue { src, dst, .. } => {
+                    let value_layout = plan.dag[index].copy_value_layout();
                     let source = storage
                         .get(src)
                         .ok_or_else(|| anyhow!("copy reads missing buffer"))?;
-                    let (n, _, bytes, name) = geometry[dst];
-                    ensure!(
-                        source.len() == n && source.type_name() == name,
-                        "copy length/type mismatch"
-                    );
+                    let (n, dtype, bytes, name) = geometry[dst];
+                    ensure!(source.type_name() == name, "copy dtype mismatch");
+                    let copy = if let Some(layout) = value_layout {
+                        ensure!(layout.dtype == Some(dtype), "value copy dtype mismatch");
+                        let count = layout.span_with(&self.dims)?;
+                        let mut target = if let Some(target) = storage.get(dst) {
+                            target.as_ref().clone()
+                        } else {
+                            TypedBuffer::zeroed(dtype, n)?
+                        };
+                        target.copy_prefix_from(source, count)?;
+                        target
+                    } else {
+                        ensure!(source.len() == n, "copy length mismatch");
+                        source.as_ref().clone()
+                    };
                     reserve_live(&mut live, bytes, budget, &mut self.peak_live_bytes)?;
-                    let copy = source.as_ref().clone();
                     if let Some(Cow::Owned(old)) = storage.insert(dst.clone(), Cow::Owned(copy)) {
                         live -= old.byte_len();
                     }
@@ -957,6 +970,10 @@ impl ReferenceRuntime {
     /// observe-only cast to F32).
     pub fn get_i32(&self, tensor: petgraph::graph::NodeIndex) -> Result<&Vec<i32>> {
         self.get_typed(self.output_buffer(tensor)?)?.as_i32()
+    }
+
+    pub fn get_tf32(&self, tensor: petgraph::graph::NodeIndex) -> Result<&Vec<crate::tf32::Tf32>> {
+        self.get_typed(self.output_buffer(tensor)?)?.as_tf32()
     }
 
     /// The i64 twin of [`Self::get_f32`].

@@ -12,6 +12,8 @@ pub(crate) fn code(data: &TypedBuffer, i: usize) -> Result<u64> {
     ensure!(i < data.len(), "bit view reads outside backing storage");
     Ok(match data {
         TypedBuffer::F32(v) => u64::from(v[i].to_bits()),
+        // Logical TF32 has nineteen encoding bits in a 32-bit backing word.
+        TypedBuffer::TF32(v) => u64::from(v[i].to_bits() >> 13),
         TypedBuffer::F64(v) => v[i].to_bits(),
         TypedBuffer::I32(v) => u64::from(v[i] as u32),
         TypedBuffer::I64(v) => v[i] as u64,
@@ -37,6 +39,7 @@ pub(crate) fn set_code(data: &mut TypedBuffer, i: usize, code: u64) -> Result<()
     ensure!(i < data.len(), "bit encoding write outside destination");
     match data {
         TypedBuffer::F32(v) => v[i] = f32::from_bits(code as u32),
+        TypedBuffer::TF32(v) => v[i] = crate::Tf32::from_precision_bits(code)?,
         TypedBuffer::F64(v) => v[i] = f64::from_bits(code),
         TypedBuffer::I32(v) => v[i] = code as i32,
         TypedBuffer::I64(v) => v[i] = code as i64,
@@ -140,6 +143,25 @@ pub(crate) fn read_view(
 mod tests {
     use super::*;
     use luminal::layouts::{BitWidthTerm, IntExprTerm as E, ShapeTerm};
+
+    #[test]
+    fn tf32_precision_codes_preserve_exact_bits_in_full_word_storage() {
+        let mut values = TypedBuffer::TF32(vec![crate::Tf32::default(); 6]);
+        for (i, bits) in [0, 1 << 18, 1, 0x1fc00, 0x1fc01, 0x7ffff]
+            .into_iter()
+            .enumerate()
+        {
+            set_code(&mut values, i, bits).unwrap();
+            assert_eq!(code(&values, i).unwrap(), bits);
+            assert_eq!(
+                u64::from(values.as_tf32().unwrap()[i].to_bits()),
+                bits << 13
+            );
+        }
+        assert_eq!(values.byte_len(), 24);
+        assert!(set_code(&mut values, 0, 1 << 19).is_err());
+    }
+
     #[test]
     fn bit_reads_handle_subbyte_origins_and_skip_unaccessed_bits() {
         let layout = DecodedLayout::of(

@@ -38,6 +38,8 @@ use anyhow::Result;
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypedBuffer {
     F32(Vec<f32>),
+    /// TF32 precision in validated 32-bit backing words; arithmetic requires widening.
+    TF32(Vec<crate::tf32::Tf32>),
     /// Double-precision floats. A model that declares F64 executes in
     /// F64: silently bridging through F32 would hide a precision
     /// downgrade behind a dtype tag, which is the one thing the
@@ -112,6 +114,10 @@ macro_rules! same_variant_match {
             (
                 $crate::typed_buffer::TypedBuffer::F32($a),
                 $crate::typed_buffer::TypedBuffer::F32($b),
+            ) => $body,
+            (
+                $crate::typed_buffer::TypedBuffer::TF32($a),
+                $crate::typed_buffer::TypedBuffer::TF32($b),
             ) => $body,
             (
                 $crate::typed_buffer::TypedBuffer::F64($a),
@@ -205,6 +211,19 @@ macro_rules! typed_accessors {
 }
 
 impl TypedBuffer {
+    /// Copy a value's declared storage span while preserving spare capacity.
+    pub fn copy_prefix_from(&mut self, source: &Self, count: usize) -> Result<()> {
+        same_variant_match!(
+            (self, source),
+            (dest, source) => {
+                anyhow::ensure!(count <= dest.len() && count <= source.len(), "value copy exceeds buffer capacity");
+                dest[..count].copy_from_slice(&source[..count]);
+            },
+            (_dest, _source) => anyhow::bail!("value copy dtype mismatch")
+        );
+        Ok(())
+    }
+
     /// The validated Bool8 entry point — the ONLY way caller bytes
     /// become boolean storage. The two-legal-codes invariant is
     /// established here, at the door, so an ill-formed code never
@@ -224,6 +243,7 @@ impl TypedBuffer {
     pub fn len(&self) -> usize {
         match self {
             TypedBuffer::F32(values) => values.len(),
+            TypedBuffer::TF32(values) => values.len(),
             TypedBuffer::F64(values) => values.len(),
             TypedBuffer::I32(values) => values.len(),
             TypedBuffer::I64(values) => values.len(),
@@ -248,6 +268,7 @@ impl TypedBuffer {
     pub fn type_name(&self) -> &'static str {
         match self {
             TypedBuffer::F32(_) => "f32",
+            TypedBuffer::TF32(_) => "tf32",
             TypedBuffer::F64(_) => "f64",
             TypedBuffer::I32(_) => "i32",
             TypedBuffer::I64(_) => "i64",
@@ -270,6 +291,8 @@ impl TypedBuffer {
     pub fn is_narrow_float(&self) -> bool {
         narrow_float_match!(self, _codes => true, _other => false)
     }
+
+    typed_accessors!(TF32, crate::tf32::Tf32, as_tf32, as_tf32_mut, "a tf32");
 
     pub fn as_f32(&self) -> Result<&Vec<f32>> {
         match self {
@@ -379,22 +402,35 @@ impl TypedBuffer {
         }
     }
 
-    /// A fresh zero-filled buffer of the same variant and length —
-    /// the executor's dest-allocation shape.
-    pub fn byte_len(&self) -> usize {
-        let width = match self {
+    /// Physical reference storage width, distinct from logical precision.
+    pub(crate) fn element_bytes(&self) -> usize {
+        match self {
             Self::F64(_) | Self::I64(_) | Self::U64(_) => 8,
-            Self::F32(_) | Self::I32(_) => 4,
-            Self::I16(_) | Self::F16(_) | Self::Bf16(_) => 2,
+            Self::F32(_) | Self::TF32(_) | Self::I32(_) => 4,
+            Self::F16(_) | Self::Bf16(_) | Self::I16(_) => 2,
             _ => 1,
-        };
-        self.len() * width
+        }
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.len() * self.element_bytes()
+    }
+
+    /// Serialized layout widths describe logical precision. TF32's nineteen
+    /// bits occupy a full word in this runtime; Bool's one bit occupies a byte.
+    pub(crate) fn storage_bytes_for_width(bits: i64) -> Result<usize> {
+        Ok(if bits == 19 {
+            std::mem::size_of::<crate::tf32::Tf32>()
+        } else {
+            usize::try_from(bits)?.div_ceil(8)
+        })
     }
 
     pub(crate) fn zeroed(dtype: luminal::dtype::PlanDtype, n: usize) -> Result<Self> {
         use luminal::dtype::PlanDtype as D;
         Ok(match dtype {
             D::F32 => Self::F32(vec![0.; n]),
+            D::TF32 => Self::TF32(vec![crate::tf32::Tf32::default(); n]),
             D::F64 => Self::F64(vec![0.; n]),
             D::Int => Self::I32(vec![0; n]),
             D::Int64 => Self::I64(vec![0; n]),
@@ -416,6 +452,9 @@ impl TypedBuffer {
     pub fn zeroed_like(&self) -> TypedBuffer {
         match self {
             TypedBuffer::F32(values) => TypedBuffer::F32(vec![0.0; values.len()]),
+            TypedBuffer::TF32(values) => {
+                TypedBuffer::TF32(vec![crate::tf32::Tf32::default(); values.len()])
+            }
             TypedBuffer::F64(values) => TypedBuffer::F64(vec![0.0; values.len()]),
             TypedBuffer::I32(values) => TypedBuffer::I32(vec![0; values.len()]),
             TypedBuffer::I64(values) => TypedBuffer::I64(vec![0; values.len()]),
@@ -992,5 +1031,11 @@ impl ReferenceKernelCtx {
             }
         }
         Ok(())
+    }
+}
+
+impl From<Vec<crate::tf32::Tf32>> for TypedBuffer {
+    fn from(values: Vec<crate::tf32::Tf32>) -> Self {
+        Self::TF32(values)
     }
 }

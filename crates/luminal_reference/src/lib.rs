@@ -29,6 +29,7 @@ pub mod narrow_float;
 pub mod ops;
 pub mod runtime;
 pub mod search;
+pub mod tf32;
 pub mod typed_buffer;
 
 pub use bindings::{Bound, BoundProgram, ReferenceBindings};
@@ -39,6 +40,7 @@ pub use search::{
     CompileOptions, SearchOutcome, harness_search_options, search_implementations,
     search_implementations_with_ops,
 };
+pub use tf32::Tf32;
 pub use typed_buffer::{ReferenceKernelCtx, TypedBuffer};
 
 /// The reference-registry assembled program (core's
@@ -62,3 +64,6 @@ pub fn decoder_registry() -> &'static luminal::egglog_utils::eclass::Constructor
             .expect("the built-in reference registry has no duplicate decoders")
     })
 }
+
+// Public scalar types for the reference runtime's narrow floating payloads.
+pub use half::{bf16, f16};

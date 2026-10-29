@@ -1,0 +1,10 @@
+; Independent D storage: the writing destination is added by DPS conversion.
+(rule
+  ((cublaslt-approved-inputs ?configuration ?A_descriptor ?B_descriptor ?C_argument
+     ?bias_argument ?D_descriptor ?frame ?scalars ?input_tensors)
+   (= ?D_descriptor (CublasLtMatrixDescriptorOf ?D_tensor ?D_layout)))
+  ((union (LayoutTensorOpLit ?input_tensors (LayoutTensorCons ?D_tensor (LayoutTensorNil)))
+     (LayoutTensorOpCublasLtCall ?configuration ?A_descriptor ?B_descriptor ?C_argument
+       ?bias_argument ?D_descriptor ?input_tensors ?frame ?scalars)))
+  :ruleset backend
+  :name "cublaslt: emit approved separate destination call")

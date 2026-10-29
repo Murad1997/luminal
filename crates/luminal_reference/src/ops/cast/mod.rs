@@ -149,6 +149,62 @@ pub(crate) fn kernel(
     {
         return uint64_cast(ctx);
     }
+    if matches!(ctx.operands[0], TypedBuffer::TF32(_))
+        || matches!(ctx.dests[0], TypedBuffer::TF32(_))
+    {
+        macro_rules! convert {
+            ($input:expr, $dest:expr, $conversion:expr) => {{
+                anyhow::ensure!($input.len() == $dest.len(), "cast length mismatch");
+                for (out, value) in $dest.iter_mut().zip($input) {
+                    *out = ($conversion)(*value);
+                }
+            }};
+        }
+        match (&ctx.operands[0], &mut ctx.dests[0]) {
+            (TypedBuffer::TF32(input), TypedBuffer::F16(dest)) => {
+                convert!(input, dest, |x: crate::Tf32| half::f16::from_f32(
+                    x.to_f32()
+                ))
+            }
+            (TypedBuffer::F16(input), TypedBuffer::TF32(dest)) => {
+                convert!(input, dest, |x: half::f16| crate::Tf32::from_f32(
+                    x.to_f32()
+                ))
+            }
+            (TypedBuffer::TF32(input), TypedBuffer::Bf16(dest)) => {
+                convert!(input, dest, |x: crate::Tf32| half::bf16::from_f32(
+                    x.to_f32()
+                ))
+            }
+            (TypedBuffer::Bf16(input), TypedBuffer::TF32(dest)) => {
+                convert!(input, dest, |x: half::bf16| crate::Tf32::from_f32(
+                    x.to_f32()
+                ))
+            }
+            (TypedBuffer::F32(input), TypedBuffer::TF32(dest)) => {
+                anyhow::ensure!(input.len() == dest.len(), "cast length mismatch");
+                for (out, value) in dest.iter_mut().zip(input) {
+                    *out = crate::tf32::Tf32::from_f32(*value);
+                }
+            }
+            (TypedBuffer::TF32(input), TypedBuffer::F32(dest)) => {
+                anyhow::ensure!(input.len() == dest.len(), "cast length mismatch");
+                for (out, value) in dest.iter_mut().zip(input) {
+                    *out = value.to_f32();
+                }
+            }
+            (TypedBuffer::TF32(input), TypedBuffer::TF32(dest)) => {
+                anyhow::ensure!(input.len() == dest.len(), "cast length mismatch");
+                dest.copy_from_slice(input);
+            }
+            (source, dest) => anyhow::bail!(
+                "TF32 cast between {} and {} is unsupported",
+                source.type_name(),
+                dest.type_name()
+            ),
+        }
+        return Ok(());
+    }
     const F32_EXACT_INT: i64 = 1 << 24;
     // NARROW FLOATS (F16/BF16/fp8): storage formats the runtime never
     // computes in, so a cast is the ONLY arithmetic they see. One

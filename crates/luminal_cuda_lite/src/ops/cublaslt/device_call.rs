@@ -6,7 +6,7 @@ use cudarc::cublaslt::sys;
 use cudarc::driver::{CudaStream, DevicePtr};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use super::exec::{CSource, LtCall, LtDesc, LtOrder};
+use super::exec::{LtActivation, LtCall, LtComputation, LtDesc, LtOrder, LtScalars};
 
 /// Workspace owned by US (contract: no silent fallback algos). 32 MiB —
 /// cuBLASLt's own recommendation ceiling for pre-Hopper devices is
@@ -14,13 +14,6 @@ use super::exec::{CSource, LtCall, LtDesc, LtOrder};
 /// into the heuristic preference so the chosen algo fits what we hand
 /// over.
 const WORKSPACE_BYTES: usize = 32 * 1024 * 1024;
-
-/// alpha is ALWAYS the literal 1.0f (the marker has no alpha channel);
-/// beta's two legal literals are structural. POINTER_MODE_HOST reads
-/// these from host memory at the call.
-const ALPHA: f32 = 1.0;
-const BETA_ZERO: f32 = 0.0;
-const BETA_ONE: f32 = 1.0;
 
 /// The process-wide cuBLASLt handle. Creation runs the TF32 strictness
 /// detector once (contract 5); the raw handle is Send-guarded behind a
@@ -105,9 +98,7 @@ pub fn assert_compute_strictness() -> Result<()> {
 /// COL-major under a row-major disclosure), and hardcoding ROW here
 /// while the plan elected a left-major destination was the Option-B
 /// destination-frame regression. The order is DATA on the descriptor
-/// (see `exec.rs`'s ROW CONVENTION for A/B and
-/// `exec::bind_destination` for C/D) precisely so this site cannot
-/// hold an opinion of its own.
+/// selected by the complete egglog proof for every matrix.
 struct Layout {
     raw: sys::cublasLtMatrixLayout_t,
 }
@@ -117,6 +108,7 @@ impl Layout {
         let dtype = match dtype {
             luminal::dtype::PlanDtype::F32 => sys::cudaDataType_t::CUDA_R_32F,
             luminal::dtype::PlanDtype::Bf16 => sys::cudaDataType_t::CUDA_R_16BF,
+            luminal::dtype::PlanDtype::F16 => sys::cudaDataType_t::CUDA_R_16F,
             dtype => return Err(anyhow!("cuBLASLt unsupported matrix dtype {dtype:?}")),
         };
         let raw = lt::create_matrix_layout(
@@ -140,6 +132,27 @@ impl Layout {
             )
         }
         .map_err(|e| anyhow!("cublasLtMatrixLayoutSetAttribute({order:?}): {e:?}"))?;
+        let count =
+            i32::try_from(desc.batch_count).context("cuBLASLt batch count exceeds int32")?;
+        let stride = desc.batch_stride_in_elements;
+        unsafe {
+            lt::set_matrix_layout_attribute(
+                layout.raw,
+                sys::cublasLtMatrixLayoutAttribute_t::CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
+                (&count) as *const _ as *const _,
+                std::mem::size_of::<i32>(),
+            )
+        }
+        .map_err(|e| anyhow!("cuBLASLt batch count: {e:?}"))?;
+        unsafe {
+            lt::set_matrix_layout_attribute(
+                layout.raw,
+                sys::cublasLtMatrixLayoutAttribute_t::CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+                (&stride) as *const _ as *const _,
+                std::mem::size_of::<i64>(),
+            )
+        }
+        .map_err(|e| anyhow!("cuBLASLt batch stride: {e:?}"))?;
         Ok(layout)
     }
 }
@@ -178,21 +191,21 @@ pub fn prepare(
     dest: DeviceRange,
     workspace: DeviceRange,
 ) -> Result<PreparedCall> {
-    // BIAS/ORDER TRIPWIRE, DEFENSE IN DEPTH (ruling 2026-09-01): a
-    // planned bias form arrives with a COL D — the estate's bias
-    // decorators require a LeftMajor D and `exec::bind_destination`
-    // already ran this check. A hand-built bias call with a ROW D is
-    // the one way to reach this line with the wrong order; refuse it
-    // BEFORE any library call with the measured finding (the library
-    // rejects BIAS/RELU_BIAS on a ROW-order D).
+    // Vendor behavior is checked for direct descriptor calls too. The
+    // production whitelist already requires column order for bias.
     super::exec::assert_bias_destination_order(call, "dispatch")?;
     // Pre-dispatch bounds gate (contract 4) — LOUD, before any library
-    // call, byte counts converted to f32 element counts.
+    // call, byte counts converted using each operand's declared dtype.
     let mut elems = Vec::with_capacity(operands.len());
     for (index, range) in operands.iter().enumerate() {
         let dtype = match index {
             0 => call.a_dtype,
             1 => call.b_dtype,
+            i if call.c.is_some_and(|c| c.operand == i) => call.c.unwrap().data_type,
+            i if call.bias.is_some_and(|bias| bias.operand == i) => call.bias.unwrap().data_type,
+            i if matches!(call.scalars, LtScalars::Device { alpha_operand, beta_operand } if i == alpha_operand || i == beta_operand) => {
+                call.scale_dtype
+            }
             _ => call.d_dtype,
         };
         elems.push(range.bytes / crate::host_buffer::dtype_bytes(dtype)?);
@@ -208,14 +221,16 @@ pub fn prepare(
         .lock()
         .map_err(|_| anyhow!("cuBLASLt handle mutex poisoned"))?;
 
-    // Matmul descriptor: strict F32 compute (contract 1/5), HOST
-    // pointer mode (contract 2), transposes, epilogue.
+    // Decode the elected computation contract. TF32 requires explicit input
+    // cast proofs and a complete whitelist row; there is no global math flag.
+    // As agreed, the configured mode executes and NVIDIA_TF32_OVERRIDE is unset.
+    let computation = match call.computation {
+        LtComputation::Float32 => sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+        LtComputation::TensorFloat32 => sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32,
+    };
     let desc = Desc {
-        raw: lt::create_matmul_desc(
-            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            sys::cudaDataType_t::CUDA_R_32F,
-        )
-        .map_err(|e| anyhow!("cublasLtMatmulDescCreate: {e:?}"))?,
+        raw: lt::create_matmul_desc(computation, sys::cudaDataType_t::CUDA_R_32F)
+            .map_err(|e| anyhow!("cublasLtMatmulDescCreate: {e:?}"))?,
     };
     let set_desc = |attr: sys::cublasLtMatmulDescAttributes_t,
                     buf: *const std::ffi::c_void,
@@ -224,7 +239,10 @@ pub fn prepare(
         unsafe { lt::set_matmul_desc_attribute(desc.raw, attr, buf, size) }
             .map_err(|e| anyhow!("cublasLtMatmulDescSetAttribute({attr:?}): {e:?}"))
     };
-    let pointer_mode = sys::cublasLtPointerMode_t::CUBLASLT_POINTER_MODE_HOST;
+    let pointer_mode = match call.scalars {
+        LtScalars::Host { .. } => sys::cublasLtPointerMode_t::CUBLASLT_POINTER_MODE_HOST,
+        LtScalars::Device { .. } => sys::cublasLtPointerMode_t::CUBLASLT_POINTER_MODE_DEVICE,
+    };
     set_desc(
         sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_POINTER_MODE,
         (&pointer_mode) as *const _ as *const _,
@@ -243,24 +261,44 @@ pub fn prepare(
         std::mem::size_of::<i32>(),
     )?;
 
-    // Epilogue: exactly the four the marker claims — Default / Relu /
-    // Bias / ReluBias. Nothing else is expressible from an LtCall.
-    let epilogue = match (call.relu, call.bias_operand.is_some()) {
-        (false, false) => sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_DEFAULT,
-        (true, false) => sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_RELU,
-        (false, true) => sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_BIAS,
-        (true, true) => sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_RELU_BIAS,
+    // Decode only the elected activation and optional bias. Their admission
+    // and approximation policy are owned by the egglog configuration proof.
+    let epilogue = match (call.activation, call.bias.is_some()) {
+        (LtActivation::Identity, false) => sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_DEFAULT,
+        (LtActivation::RectifiedLinear, false) => sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_RELU,
+        (LtActivation::Identity, true) => sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_BIAS,
+        (LtActivation::RectifiedLinear, true) => {
+            sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_RELU_BIAS
+        }
+        (LtActivation::GaussianErrorLinear, false) => {
+            sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_GELU
+        }
+        (LtActivation::GaussianErrorLinear, true) => {
+            sys::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_GELU_BIAS
+        }
     };
     set_desc(
         sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_EPILOGUE,
         (&epilogue) as *const _ as *const _,
         std::mem::size_of::<sys::cublasLtEpilogue_t>(),
     )?;
-    if let Some(bias_idx) = call.bias_operand {
+    if let Some(bias) = call.bias {
+        let bias_idx = bias.operand;
         let bias_ptr = operands
             .get(bias_idx)
             .ok_or_else(|| anyhow!("bias operand {bias_idx} missing"))?
             .ptr;
+        let bias_type = match bias.data_type {
+            luminal::dtype::PlanDtype::F32 => sys::cudaDataType_t::CUDA_R_32F,
+            luminal::dtype::PlanDtype::Bf16 => sys::cudaDataType_t::CUDA_R_16BF,
+            luminal::dtype::PlanDtype::F16 => sys::cudaDataType_t::CUDA_R_16F,
+            other => anyhow::bail!("unsupported cuBLASLt bias storage {other:?}"),
+        };
+        set_desc(
+            sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE,
+            (&bias_type) as *const _ as *const _,
+            std::mem::size_of::<sys::cudaDataType_t>(),
+        )?;
         set_desc(
             sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_POINTER,
             (&bias_ptr) as *const _ as *const _,
@@ -272,7 +310,8 @@ pub fn prepare(
     // NULL Cdesc segfaults), plus D.
     let a_layout = Layout::new(&call.a, call.a_dtype)?;
     let b_layout = Layout::new(&call.b, call.b_dtype)?;
-    let c_layout = Layout::new(&call.c, call.d_dtype)?;
+    let c_descriptor = call.c.map_or(call.d, |c| c.descriptor);
+    let c_layout = Layout::new(&c_descriptor, call.c.map_or(call.d_dtype, |c| c.data_type))?;
     let d_layout = Layout::new(&call.d, call.d_dtype)?;
 
     let pref =
@@ -299,6 +338,39 @@ pub fn prepare(
     }
     .map_err(|e| anyhow!("workspace preference: {e:?}"))?;
 
+    if call.d_dtype != luminal::dtype::PlanDtype::F32 {
+        // The graph rounds only the final output. Split-K reductions must
+        // keep their partial sums in FP32, never the narrow output type.
+        // NONE (zero) remains available alongside COMPUTE_TYPE.
+        let reduction_mask =
+            sys::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE as u32;
+        unsafe {
+            lt::set_matmul_pref_attribute(pref.raw,
+                sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,
+                (&reduction_mask) as *const _ as *const _, std::mem::size_of::<u32>())
+        }.map_err(|e| anyhow!("FP32 intermediate reduction preference: {e:?}"))?;
+    }
+
+    if call.computation == LtComputation::TensorFloat32 {
+        // FAST_TF32 alone permits a full-F32 algorithm (observed for 1x1 on
+        // A100), which would skip authored input rounding. Request algorithms
+        // whose multiplication inputs actually use TF32 precision. Unsupported
+        // geometries retain ordinary materialized-rounding candidates.
+        // cublasLt.h macros are absent from cudarc's generated Rust bindings.
+        const INPUT_TYPE_MASK: u64 = 0xff << 16;
+        const INPUT_TF32: u64 = 0x04 << 16;
+        let implementation_mask = !INPUT_TYPE_MASK | INPUT_TF32;
+        unsafe {
+            lt::set_matmul_pref_attribute(
+                pref.raw,
+                sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_IMPL_MASK,
+                (&implementation_mask) as *const _ as *const _,
+                std::mem::size_of::<u64>(),
+            )
+        }
+        .map_err(|e| anyhow!("TF32 numerical implementation preference: {e:?}"))?;
+    }
+
     let heuristic = unsafe {
         lt::get_matmul_algo_heuristic(
             guard.raw,
@@ -321,24 +393,61 @@ pub fn prepare(
             call.k,
             call.a.ld,
             call.b.ld,
-            call.c.ld,
+            c_descriptor.ld,
             call.d.ld
         )
     })?;
 
-    // Pointers. Literal HOST scalars (contract 2): alpha = 1.0f const;
-    // beta structural. C pointer: the c operand on the C-fold forms,
-    // the D pointer otherwise (beta = 0.0f, C never read — contract 3).
+    // Pointer location is an algorithm capability as well as a descriptor
+    // attribute. Refuse an unavailable elected mode rather than reading a GPU
+    // scalar on the host or substituting a different numerical contract.
+    let mut supported_pointer_modes: u32 = 0;
+    let mut written = 0usize;
+    let status = unsafe {
+        sys::cublasLtMatmulAlgoCapGetAttribute(
+            &heuristic.algo,
+            sys::cublasLtMatmulAlgoCapAttributes_t::CUBLASLT_ALGO_CAP_POINTER_MODE_MASK,
+            (&mut supported_pointer_modes) as *mut _ as *mut _,
+            std::mem::size_of::<u32>(),
+            &mut written,
+        )
+    };
+    let required_pointer_mode = match call.scalars {
+        LtScalars::Host { .. } => {
+            sys::cublasLtPointerModeMask_t::CUBLASLT_POINTER_MODE_MASK_HOST as u32
+        }
+        LtScalars::Device { .. } => {
+            sys::cublasLtPointerModeMask_t::CUBLASLT_POINTER_MODE_MASK_DEVICE as u32
+        }
+    };
+    if status != sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS
+        || written != std::mem::size_of::<u32>()
+        || supported_pointer_modes & required_pointer_mode == 0
+    {
+        anyhow::bail!(
+            "cuBLASLt algorithm does not support the elected alpha/beta pointer mode: {pointer_mode:?} ({status:?}, mask={supported_pointer_modes:#x})"
+        );
+    }
+
+    // The approved scalar arguments determine both pointers. Host literals
+    // are owned by PreparedCall; device values stay live graph dependencies.
+    let scalars = match call.scalars {
+        LtScalars::Host { .. } => {
+            let (alpha, beta) = call.scalars.host_values().unwrap();
+            PreparedScalars::Host { alpha, beta }
+        }
+        LtScalars::Device {
+            alpha_operand,
+            beta_operand,
+        } => PreparedScalars::Device {
+            alpha: operands[alpha_operand].ptr,
+            beta: operands[beta_operand].ptr,
+        },
+    };
     let a_ptr = operands[0].ptr;
     let b_ptr = operands[1].ptr;
     let d_ptr = dest.ptr;
-    let (c_ptr, beta): (u64, &'static f32) = match call.c_source {
-        CSource::AliasD => (d_ptr, &BETA_ZERO),
-        CSource::Operand(i) => {
-            debug_assert!(call.beta_is_one);
-            (operands[i].ptr, &BETA_ONE)
-        }
-    };
+    let c_ptr = call.c.map_or(d_ptr, |c| operands[c.operand].ptr);
     Ok(PreparedCall {
         desc,
         a_layout,
@@ -350,7 +459,7 @@ pub fn prepare(
         b_ptr,
         c_ptr,
         d_ptr,
-        beta,
+        scalars,
         workspace,
     })
 }
@@ -367,20 +476,32 @@ pub struct PreparedCall {
     b_ptr: u64,
     c_ptr: u64,
     d_ptr: u64,
-    beta: &'static f32,
+    scalars: PreparedScalars,
     workspace: DeviceRange,
+}
+enum PreparedScalars {
+    Host { alpha: f32, beta: f32 },
+    Device { alpha: u64, beta: u64 },
 }
 impl PreparedHostOp for PreparedCall {
     unsafe fn record(&self, capture: &CaptureCtx<'_>) -> Result<()> {
         let guard = handle()?
             .lock()
             .map_err(|_| anyhow!("cuBLASLt handle mutex poisoned"))?;
+        let (alpha, beta): (*const std::ffi::c_void, *const std::ffi::c_void) = match &self.scalars
+        {
+            PreparedScalars::Host { alpha, beta } => (
+                alpha as *const f32 as *const _,
+                beta as *const f32 as *const _,
+            ),
+            PreparedScalars::Device { alpha, beta } => (*alpha as *const _, *beta as *const _),
+        };
         unsafe {
             lt::matmul(
                 guard.raw,
                 self.desc.raw,
-                (&ALPHA) as *const f32 as *const _,
-                self.beta as *const f32 as *const _,
+                alpha,
+                beta,
                 self.a_ptr as *const _,
                 self.a_layout.raw,
                 self.b_ptr as *const _,
